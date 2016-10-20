@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package nodefs
 
 import (
@@ -27,8 +31,9 @@ type fileSystemMount struct {
 	// Options for the mount.
 	options *Options
 
-	// Protects Children hashmaps within the mount.  treeLock
-	// should be acquired before openFilesLock.
+	// Protects the "children" and "parents" hashmaps of the inodes
+	// within the mount.
+	// treeLock should be acquired before openFilesLock.
 	//
 	// If multiple treeLocks must be acquired, the treeLocks
 	// closer to the root must be acquired first.
@@ -50,7 +55,6 @@ func (m *fileSystemMount) mountName() string {
 		}
 	}
 	panic("not found")
-	return ""
 }
 
 func (m *fileSystemMount) setOwner(attr *fuse.Attr) {
@@ -71,7 +75,9 @@ func (m *fileSystemMount) fillEntry(out *fuse.EntryOut) {
 func (m *fileSystemMount) fillAttr(out *fuse.AttrOut, nodeId uint64) {
 	splitDuration(m.options.AttrTimeout, &out.AttrValid, &out.AttrValidNsec)
 	m.setOwner(&out.Attr)
-	out.Ino = nodeId
+	if out.Ino == 0 {
+		out.Ino = nodeId
+	}
 }
 
 func (m *fileSystemMount) getOpenedFile(h uint64) *openedFile {
@@ -99,7 +105,11 @@ func (m *fileSystemMount) unregisterFileHandle(handle uint64, node *Inode) *open
 	}
 
 	l := len(node.openFiles)
-	node.openFiles[idx] = node.openFiles[l-1]
+	if idx == l-1 {
+		node.openFiles[idx] = nil
+	} else {
+		node.openFiles[idx] = node.openFiles[l-1]
+	}
 	node.openFiles = node.openFiles[:l-1]
 	node.openFilesMutex.Unlock()
 
@@ -132,7 +142,7 @@ func (m *fileSystemMount) registerFileHandle(node *Inode, dir *connectorDir, f F
 		b.WithFlags.File.SetInode(node)
 	}
 	node.openFiles = append(node.openFiles, b)
-	handle := m.openFiles.Register(&b.handled)
+	handle, _ := m.openFiles.Register(&b.handled)
 	node.openFilesMutex.Unlock()
 	return handle, b
 }

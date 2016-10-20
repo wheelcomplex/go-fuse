@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package nodefs
 
 // This file contains FileSystemConnector's implementation of
@@ -21,6 +25,13 @@ func (c *FileSystemConnector) RawFS() fuse.RawFileSystem {
 type rawBridge FileSystemConnector
 
 func (c *rawBridge) Fsync(input *fuse.FsyncIn) fuse.Status {
+	node := c.toInode(input.NodeId)
+	opened := node.mount.getOpenedFile(input.Fh)
+
+	if opened != nil {
+		return opened.WithFlags.File.Fsync(int(input.FsyncFlags))
+	}
+
 	return fuse.ENOSYS
 }
 
@@ -48,6 +59,7 @@ func (c *rawBridge) String() string {
 
 func (c *rawBridge) Init(s *fuse.Server) {
 	c.server = s
+	c.rootNode.Node().OnMount((*FileSystemConnector)(c))
 }
 
 func (c *FileSystemConnector) lookupMountUpdate(out *fuse.Attr, mount *fileSystemMount) (node *Inode, code fuse.Status) {
@@ -61,8 +73,14 @@ func (c *FileSystemConnector) lookupMountUpdate(out *fuse.Attr, mount *fileSyste
 	return mount.mountInode, fuse.OK
 }
 
+// internalLookup executes a lookup without affecting NodeId reference counts.
 func (c *FileSystemConnector) internalLookup(out *fuse.Attr, parent *Inode, name string, header *fuse.InHeader) (node *Inode, code fuse.Status) {
+
+	// We may already know the child because it was created using Create or Mkdir,
+	// from an earlier lookup, or because the nodes were created in advance
+	// (in-memory filesystems).
 	child := parent.GetChild(name)
+
 	if child != nil && child.mountPoint != nil {
 		return c.lookupMountUpdate(out, child.mountPoint)
 	}
@@ -98,9 +116,10 @@ func (c *rawBridge) Lookup(header *fuse.InHeader, name string, out *fuse.EntryOu
 	}
 
 	child.mount.fillEntry(out)
-	out.NodeId = c.fsConn().lookupUpdate(child)
-	out.Generation = child.generation
-	out.Ino = out.NodeId
+	out.NodeId, out.Generation = c.fsConn().lookupUpdate(child)
+	if out.Ino == 0 {
+		out.Ino = out.NodeId
+	}
 
 	return fuse.OK
 }
@@ -125,6 +144,12 @@ func (c *rawBridge) GetAttr(input *fuse.GetAttrIn, out *fuse.AttrOut) (code fuse
 		return code
 	}
 
+	if out.Nlink == 0 {
+		// With Nlink == 0, newer kernels will refuse link
+		// operations.
+		out.Nlink = 1
+	}
+
 	node.mount.fillAttr(out, input.NodeId)
 	return fuse.OK
 }
@@ -139,8 +164,8 @@ func (c *rawBridge) OpenDir(input *fuse.OpenIn, out *fuse.OpenOut) (code fuse.St
 	de := &connectorDir{
 		node: node.Node(),
 		stream: append(stream,
-			fuse.DirEntry{fuse.S_IFDIR, "."},
-			fuse.DirEntry{fuse.S_IFDIR, ".."}),
+			fuse.DirEntry{Mode: fuse.S_IFDIR, Name: "."},
+			fuse.DirEntry{Mode: fuse.S_IFDIR, Name: ".."}),
 		rawFS: c,
 	}
 	h, opened := node.mount.registerFileHandle(node, de, nil, input.Flags)
@@ -187,7 +212,15 @@ func (c *rawBridge) SetAttr(input *fuse.SetAttrIn, out *fuse.AttrOut) (code fuse
 		code = node.fsInode.Chmod(f, permissions, &input.Context)
 	}
 	if code.Ok() && (input.Valid&(fuse.FATTR_UID|fuse.FATTR_GID) != 0) {
-		code = node.fsInode.Chown(f, uint32(input.Uid), uint32(input.Gid), &input.Context)
+		var uid uint32 = ^uint32(0) // means "do not change" in chown(2)
+		var gid uint32 = ^uint32(0)
+		if input.Valid&fuse.FATTR_UID != 0 {
+			uid = input.Uid
+		}
+		if input.Valid&fuse.FATTR_GID != 0 {
+			gid = input.Gid
+		}
+		code = node.fsInode.Chown(f, uid, gid, &input.Context)
 	}
 	if code.Ok() && input.Valid&fuse.FATTR_SIZE != 0 {
 		code = node.fsInode.Truncate(f, input.Size, &input.Context)
@@ -428,7 +461,7 @@ func (c *rawBridge) StatFs(header *fuse.InHeader, out *fuse.StatfsOut) fuse.Stat
 	if s == nil {
 		return fuse.ENOSYS
 	}
-	*out = *(*fuse.StatfsOut)(s)
+	*out = *s
 	return fuse.OK
 }
 

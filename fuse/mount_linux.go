@@ -1,18 +1,20 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package fuse
 
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 )
-
-var fusermountBinary string
-var umountBinary string
 
 func unixgramSocketpair() (l, r *os.File, err error) {
 	fd, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
@@ -27,7 +29,7 @@ func unixgramSocketpair() (l, r *os.File, err error) {
 
 // Create a FUSE FS on the specified mount point.  The returned
 // mount point is always absolute.
-func mount(mountPoint string, options string) (fd int, err error) {
+func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
 	local, remote, err := unixgramSocketpair()
 	if err != nil {
 		return
@@ -36,12 +38,16 @@ func mount(mountPoint string, options string) (fd int, err error) {
 	defer local.Close()
 	defer remote.Close()
 
-	cmd := []string{fusermountBinary, mountPoint}
-	if options != "" {
-		cmd = append(cmd, "-o")
-		cmd = append(cmd, options)
+	bin, err := fusermountBinary()
+	if err != nil {
+		return 0, err
 	}
-	proc, err := os.StartProcess(fusermountBinary,
+
+	cmd := []string{bin, mountPoint}
+	if s := opts.optionsStrings(); len(s) > 0 {
+		cmd = append(cmd, "-o", strings.Join(s, ","))
+	}
+	proc, err := os.StartProcess(bin,
 		cmd,
 		&os.ProcAttr{
 			Env:   []string{"_FUSE_COMMFD=3"},
@@ -60,13 +66,24 @@ func mount(mountPoint string, options string) (fd int, err error) {
 		return
 	}
 
-	return getConnection(local)
+	fd, err = getConnection(local)
+	if err != nil {
+		return -1, err
+	}
+
+	close(ready)
+	return fd, err
 }
 
 func privilegedUnmount(mountPoint string) error {
 	dir, _ := filepath.Split(mountPoint)
-	proc, err := os.StartProcess(umountBinary,
-		[]string{umountBinary, mountPoint},
+	bin, err := umountBinary()
+	if err != nil {
+		return err
+	}
+
+	proc, err := os.StartProcess(bin,
+		[]string{bin, mountPoint},
 		&os.ProcAttr{Dir: dir, Files: []*os.File{nil, nil, os.Stderr}})
 	if err != nil {
 		return err
@@ -82,8 +99,12 @@ func unmount(mountPoint string) (err error) {
 	if os.Geteuid() == 0 {
 		return privilegedUnmount(mountPoint)
 	}
+	bin, err := fusermountBinary()
+	if err != nil {
+		return err
+	}
 	errBuf := bytes.Buffer{}
-	cmd := exec.Command(fusermountBinary, "-u", mountPoint)
+	cmd := exec.Command(bin, "-u", mountPoint)
 	cmd.Stderr = &errBuf
 	err = cmd.Run()
 	if errBuf.Len() > 0 {
@@ -120,14 +141,22 @@ func getConnection(local *os.File) (int, error) {
 	return int(fd), nil
 }
 
-func init() {
-	var err error
-	fusermountBinary, err = exec.LookPath("fusermount")
-	if err != nil {
-		log.Fatalf("Could not find fusermount binary: %v", err)
+// lookPathFallback - search binary in PATH and, if that fails,
+// in fallbackDir. This is useful if PATH is possible empty.
+func lookPathFallback(file string, fallbackDir string) (string, error) {
+	binPath, err := exec.LookPath(file)
+	if err == nil {
+		return binPath, nil
 	}
-	umountBinary, _ = exec.LookPath("umount")
-	if err != nil {
-		log.Fatalf("Could not find umount binary: %v", err)
-	}
+
+	abs := path.Join(fallbackDir, file)
+	return exec.LookPath(abs)
+}
+
+func fusermountBinary() (string, error) {
+	return lookPathFallback("fusermount", "/bin")
+}
+
+func umountBinary() (string, error) {
+	return lookPathFallback("umount", "/bin")
 }

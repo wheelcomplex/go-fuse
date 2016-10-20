@@ -1,10 +1,13 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package unionfs
 
 import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +21,7 @@ import (
 	"github.com/hanwen/go-fuse/fuse"
 	"github.com/hanwen/go-fuse/fuse/nodefs"
 	"github.com/hanwen/go-fuse/fuse/pathfs"
+	"github.com/hanwen/go-fuse/internal/testutil"
 )
 
 func TestFilePathHash(t *testing.T) {
@@ -52,13 +56,15 @@ func setRecursiveWritable(t *testing.T, dir string, writable bool) {
 	}
 }
 
-// Creates 3 directories on a temporary dir: /mnt with the overlayed
-// (unionfs) mount, rw with modifiable data, and ro on the bottom.
-func setupUfs(t *testing.T) (workdir string, cleanup func()) {
+// Creates a temporary dir "wd" with 3 directories:
+// mnt ... overlayed (unionfs) mount
+// rw .... modifiable data
+// ro .... read-only data
+func setupUfs(t *testing.T) (wd string, cleanup func()) {
 	// Make sure system setting does not affect test.
 	syscall.Umask(0)
 
-	wd, _ := ioutil.TempDir("", "unionfs")
+	wd = testutil.TempDir()
 	err := os.Mkdir(wd+"/mnt", 0700)
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
@@ -89,18 +95,19 @@ func setupUfs(t *testing.T) (workdir string, cleanup func()) {
 		AttrTimeout:     entryTtl / 2,
 		NegativeTimeout: entryTtl / 2,
 		PortableInodes:  true,
+		Debug:           testutil.VerboseTest(),
 	}
 
 	pathfs := pathfs.NewPathNodeFs(ufs,
-		&pathfs.PathNodeFsOptions{ClientInodes: true})
-	state, conn, err := nodefs.MountRoot(wd+"/mnt", pathfs.Root(), opts)
+		&pathfs.PathNodeFsOptions{ClientInodes: true,
+			Debug: opts.Debug,
+		})
+	state, _, err := nodefs.MountRoot(wd+"/mnt", pathfs.Root(), opts)
 	if err != nil {
 		t.Fatalf("MountNodeFileSystem failed: %v", err)
 	}
-	conn.SetDebug(VerboseTest())
-	state.SetDebug(VerboseTest())
-	pathfs.SetDebug(VerboseTest())
 	go state.Serve()
+	state.WaitMount()
 
 	return wd, func() {
 		err := state.Unmount()
@@ -238,8 +245,9 @@ func TestUnionFsChtimes(t *testing.T) {
 	}
 
 	fi, err := os.Lstat(wd + "/mnt/file")
-	stat := fuse.ToStatT(fi)
-	if stat.Atim.Sec != 82 || stat.Mtim.Sec != 83 {
+	attr := &fuse.Attr{}
+	attr.FromStat(fuse.ToStatT(fi))
+	if attr.Atime != 82 || attr.Mtime != 83 {
 		t.Error("Incorrect timestamp", fi)
 	}
 }
@@ -336,7 +344,7 @@ func TestUnionFsBasic(t *testing.T) {
 
 	WriteFile(t, wd+"/mnt/new", "new contents")
 	if !fileExists(wd + "/rw/new") {
-		t.Errorf("missing file in rw layer", names)
+		t.Errorf("missing file in rw layer: %s", wd+"/rw/new")
 	}
 
 	contents := readFromFile(t, wd+"/mnt/new")
@@ -345,7 +353,7 @@ func TestUnionFsBasic(t *testing.T) {
 	}
 	WriteFile(t, wd+"/mnt/ro1", "promote me")
 	if !fileExists(wd + "/rw/ro1") {
-		t.Errorf("missing file in rw layer", names)
+		t.Errorf("missing file in rw layer: %s", wd+"/mnt/ro1")
 	}
 
 	err := os.Remove(wd + "/mnt/new")
@@ -914,7 +922,6 @@ func ProgramVersion(bin string) (major, minor int64, err error) {
 	matches := regexp.MustCompile(".* ([0-9]+)\\.([0-9]+)").FindStringSubmatch(lines[0])
 
 	if matches == nil {
-		log.Println("no output")
 		return 0, 0, fmt.Errorf("no match for %q", lines[0])
 	}
 	major, err = strconv.ParseInt(matches[1], 10, 64)
@@ -957,10 +964,8 @@ func TestUnionFsRmRf(t *testing.T) {
 	if maj < 8 { // assuming GNU coreutils.
 		t.Skipf("Skipping test; GNU rm %d.%d is not POSIX compliant.", maj, min)
 	}
-	command := fmt.Sprintf("%s -f %s/mnt/dir", bin, wd)
-	log.Printf("Command: %s", command)
 	names, _ := Readdirnames(wd + "/mnt/dir")
-	log.Printf("Contents of %s/mnt/dir: %s", wd, strings.Join(names, ", "))
+	t.Logf("Contents of %s/mnt/dir: %s", wd, strings.Join(names, ", "))
 	cmd := exec.Command(bin, "-rf", wd+"/mnt/dir")
 	err = cmd.Run()
 	if err != nil {
@@ -1125,7 +1130,7 @@ func newDisappearingFS(fs, nop pathfs.FileSystem) *disappearingFS {
 func TestUnionFsDisappearing(t *testing.T) {
 	// This init is like setupUfs, but we want access to the
 	// writable Fs.
-	wd, _ := ioutil.TempDir("", "")
+	wd := testutil.TempDir()
 	defer os.RemoveAll(wd)
 	err := os.Mkdir(wd+"/mnt", 0700)
 	if err != nil {
@@ -1156,6 +1161,7 @@ func TestUnionFsDisappearing(t *testing.T) {
 		EntryTimeout:    entryTtl,
 		AttrTimeout:     entryTtl,
 		NegativeTimeout: entryTtl,
+		Debug:           testutil.VerboseTest(),
 	}
 
 	nfs := pathfs.NewPathNodeFs(ufs, nil)
@@ -1164,10 +1170,8 @@ func TestUnionFsDisappearing(t *testing.T) {
 		t.Fatalf("MountNodeFileSystem failed: %v", err)
 	}
 	defer state.Unmount()
-	state.SetDebug(VerboseTest())
 	go state.Serve()
-
-	log.Println("TestUnionFsDisappearing2")
+	state.WaitMount()
 
 	err = ioutil.WriteFile(wd+"/ro/file", []byte("blabla"), 0644)
 	if err != nil {
@@ -1187,17 +1191,15 @@ func TestUnionFsDisappearing(t *testing.T) {
 	if err == nil {
 		t.Fatal("Readdir should have failed")
 	}
-	log.Println("expected readdir failure:", err)
 
 	err = ioutil.WriteFile(wd+"/mnt/file2", []byte("blabla"), 0644)
 	if err == nil {
 		t.Fatal("write should have failed")
 	}
-	log.Println("expected write failure:", err)
 
-	// Restore, and wait for caches to catch up.
-	wrFs.visibleChan <- true
+	// Wait for the caches to purge, and then restore.
 	time.Sleep((3 * entryTtl) / 2)
+	wrFs.visibleChan <- true
 
 	_, err = ioutil.ReadDir(wd + "/mnt")
 	if err != nil {
@@ -1280,41 +1282,6 @@ func TestUnionFsDoubleOpen(t *testing.T) {
 
 	if string(b) != "hello" {
 		t.Errorf("r/w and r/o file are not synchronized: got %q want %q", string(b), want)
-	}
-}
-
-func TestUnionFsFdLeak(t *testing.T) {
-	beforeEntries, err := ioutil.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Fatalf("ReadDir failed: %v", err)
-	}
-
-	wd, clean := setupUfs(t)
-	err = ioutil.WriteFile(wd+"/ro/file", []byte("blablabla"), 0644)
-	if err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-	setRecursiveWritable(t, wd+"/ro", false)
-
-	contents, err := ioutil.ReadFile(wd + "/mnt/file")
-	if err != nil {
-		t.Fatalf("ReadFile failed: %v", err)
-	}
-
-	err = ioutil.WriteFile(wd+"/mnt/file", contents, 0644)
-	if err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	clean()
-
-	afterEntries, err := ioutil.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Fatalf("ReadDir failed: %v", err)
-	}
-
-	if len(afterEntries) != len(beforeEntries) {
-		t.Errorf("/proc/self/fd changed size: after %v before %v", len(beforeEntries), len(afterEntries))
 	}
 }
 
@@ -1512,10 +1479,7 @@ func TestUnionFSBarf(t *testing.T) {
 	if err := os.Rename(wd+"/rw/dir/file", wd+"/rw/file"); err != nil {
 		t.Fatalf("os.Rename: %v", err)
 	}
-
-	err := os.Rename(wd+"/mnt/file", wd+"/mnt/dir2/file")
-	if fuse.ToStatus(err) != fuse.ENOENT {
-		// TODO - this should just succeed?
+	if err := os.Rename(wd+"/mnt/file", wd+"/mnt/dir2/file"); err != nil {
 		t.Fatalf("os.Rename: %v", err)
 	}
 }

@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // The fuse package provides APIs to implement filesystems in
 // userspace.  Typically, each call of the API happens in its own
 // goroutine, so take care to make the file system thread-safe.
@@ -53,12 +57,21 @@ type MountOptions struct {
 	// This may be useful for NFS.
 	RememberInodes bool
 
-	// The name will show up on the output of the mount. Keep this string
-	// small.
+	// Values shown in "df -T" and friends
+	// First column, "Filesystem"
+	FsName string
+	// Second column, "Type", will be shown as "fuse." + Name
 	Name string
 
 	// If set, wrap the file system in a single-threaded locking wrapper.
 	SingleThreaded bool
+
+	// If set, return ENOSYS for Getxattr calls, so the kernel does not issue any
+	// Xattr operations at all.
+	DisableXAttrs bool
+
+	// If set, print debugging information.
+	Debug bool
 }
 
 // RawFileSystem is an interface close to the FUSE wire protocol.

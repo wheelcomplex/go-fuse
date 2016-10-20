@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package fuse
 
 import (
@@ -16,7 +20,7 @@ func (a *Attr) string() string {
 	return fmt.Sprintf(
 		"{M0%o SZ=%d L=%d "+
 			"%d:%d "+
-			"%d*%d %d:%d "+
+			"B%d*%d i%d:%d "+
 			"A %d.%09d "+
 			"M %d.%09d "+
 			"C %d.%09d}",

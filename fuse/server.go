@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package fuse
 
 import (
@@ -5,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,40 +35,41 @@ type Server struct {
 	// I/O with kernel and daemon.
 	mountFd int
 
-	// Dump debug info onto stdout.
-	debug bool
-
 	latencies LatencyMap
 
 	opts *MountOptions
 
-	started chan struct{}
+	// Pool for request structs.
+	reqPool sync.Pool
 
-	reqMu               sync.Mutex
-	reqPool             []*request
-	readPool            [][]byte
-	reqReaders          int
-	outstandingReadBufs int
-	kernelSettings      InitIn
+	// Pool for raw requests data
+	readPool       sync.Pool
+	reqMu          sync.Mutex
+	reqReaders     int
+	kernelSettings InitIn
 
 	singleReader bool
 	canSplice    bool
 	loops        sync.WaitGroup
+
+	ready chan error
 }
 
+// SetDebug is deprecated. Use MountOptions.Debug instead.
 func (ms *Server) SetDebug(dbg bool) {
-	ms.debug = dbg
+	// This will typically trigger the race detector.
+	ms.opts.Debug = dbg
 }
 
 // KernelSettings returns the Init message from the kernel, so
 // filesystems can adapt to availability of features of the kernel
-// driver.
-func (ms *Server) KernelSettings() InitIn {
+// driver. The message should not be altered.
+func (ms *Server) KernelSettings() *InitIn {
 	ms.reqMu.Lock()
 	s := ms.kernelSettings
 	ms.reqMu.Unlock()
 
-	return s
+	return &s
 }
 
 const _MAX_NAME_LEN = 20
@@ -133,28 +139,31 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 	if o.MaxWrite > MAX_KERNEL_WRITE {
 		o.MaxWrite = MAX_KERNEL_WRITE
 	}
-	opts = &o
-	ms := &Server{
-		fileSystem: fs,
-		started:    make(chan struct{}),
-		opts:       &o,
-	}
-
-	optStrs := opts.Options
-	if opts.AllowOther {
-		optStrs = append(optStrs, "allow_other")
-	}
-
-	name := opts.Name
-	if name == "" {
-		name = ms.fileSystem.String()
+	if o.Name == "" {
+		name := fs.String()
 		l := len(name)
 		if l > _MAX_NAME_LEN {
 			l = _MAX_NAME_LEN
 		}
-		name = strings.Replace(name[:l], ",", ";", -1)
+		o.Name = strings.Replace(name[:l], ",", ";", -1)
 	}
-	optStrs = append(optStrs, "subtype="+name)
+
+	for _, s := range o.optionsStrings() {
+		if strings.Contains(s, ",") {
+			return nil, fmt.Errorf("found ',' in option string %q", s)
+		}
+	}
+
+	ms := &Server{
+		fileSystem: fs,
+		opts:       &o,
+		// OSX has races when multiple routines read from the
+		// FUSE device: on unmount, sometime some reads do not
+		// error-out, meaning that unmount will hang.
+		singleReader: runtime.GOOS == "darwin",
+	}
+	ms.reqPool.New = func() interface{} { return new(request) }
+	ms.readPool.New = func() interface{} { return make([]byte, o.MaxWrite+PAGESIZE) }
 
 	mountPoint = filepath.Clean(mountPoint)
 	if !filepath.IsAbs(mountPoint) {
@@ -164,68 +173,97 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		}
 		mountPoint = filepath.Clean(filepath.Join(cwd, mountPoint))
 	}
-	fd, err := mount(mountPoint, strings.Join(optStrs, ","))
+	ms.ready = make(chan error, 1)
+	fd, err := mount(mountPoint, &o, ms.ready)
 	if err != nil {
 		return nil, err
 	}
 
-	ms.fileSystem.Init(ms)
 	ms.mountPoint = mountPoint
 	ms.mountFd = fd
+
+	if code := ms.handleInit(); !code.Ok() {
+		syscall.Close(fd)
+		// TODO - unmount as well?
+		return nil, fmt.Errorf("init: %s", code)
+	}
 	return ms, nil
+}
+
+func (o *MountOptions) optionsStrings() []string {
+	var r []string
+	r = append(r, o.Options...)
+
+	if o.AllowOther {
+		r = append(r, "allow_other")
+	}
+
+	if o.FsName != "" {
+		r = append(r, "fsname="+o.FsName)
+	}
+	if o.Name != "" {
+		r = append(r, "subtype="+o.Name)
+	}
+
+	return r
 }
 
 // DebugData returns internal status information for debugging
 // purposes.
 func (ms *Server) DebugData() string {
-	s := ms.opts.Buffers.String()
-
 	var r int
 	ms.reqMu.Lock()
-	r = len(ms.readPool) + ms.reqReaders
+	r = ms.reqReaders
 	ms.reqMu.Unlock()
 
-	s += fmt.Sprintf(" read buffers: %d (sz %d )",
-		r, ms.opts.MaxWrite/PAGESIZE+1)
-	return s
+	return fmt.Sprintf("readers: %d", r)
 }
 
 // What is a good number?  Maybe the number of CPUs?
 const _MAX_READERS = 2
 
+// handleEINTR retries the given function until it doesn't return syscall.EINTR.
+// This is similar to the HANDLE_EINTR() macro from Chromium ( see
+// https://code.google.com/p/chromium/codesearch#chromium/src/base/posix/eintr_wrapper.h
+// ) and the TEMP_FAILURE_RETRY() from glibc (see
+// https://www.gnu.org/software/libc/manual/html_node/Interrupted-Primitives.html
+// ).
+//
+// Don't use handleEINTR() with syscall.Close(); see
+// https://code.google.com/p/chromium/issues/detail?id=269623 .
+func handleEINTR(fn func() error) (err error) {
+	for {
+		err = fn()
+		if err != syscall.EINTR {
+			break
+		}
+	}
+	return
+}
+
 // Returns a new request, or error. In case exitIdle is given, returns
 // nil, OK if we have too many readers already.
 func (ms *Server) readRequest(exitIdle bool) (req *request, code Status) {
-	var dest []byte
-
 	ms.reqMu.Lock()
 	if ms.reqReaders > _MAX_READERS {
 		ms.reqMu.Unlock()
 		return nil, OK
 	}
-	l := len(ms.reqPool)
-	if l > 0 {
-		req = ms.reqPool[l-1]
-		ms.reqPool = ms.reqPool[:l-1]
-	} else {
-		req = new(request)
-	}
-	l = len(ms.readPool)
-	if l > 0 {
-		dest = ms.readPool[l-1]
-		ms.readPool = ms.readPool[:l-1]
-	} else {
-		dest = make([]byte, ms.opts.MaxWrite+PAGESIZE)
-	}
-	ms.outstandingReadBufs++
+	req = ms.reqPool.Get().(*request)
+	dest := ms.readPool.Get().([]byte)
 	ms.reqReaders++
 	ms.reqMu.Unlock()
 
-	n, err := syscall.Read(ms.mountFd, dest)
+	var n int
+	err := handleEINTR(func() error {
+		var err error
+		n, err = syscall.Read(ms.mountFd, dest)
+		return err
+	})
 	if err != nil {
 		code = ToStatus(err)
+		ms.reqPool.Put(req)
 		ms.reqMu.Lock()
-		ms.reqPool = append(ms.reqPool, req)
 		ms.reqReaders--
 		ms.reqMu.Unlock()
 		return nil, code
@@ -238,8 +276,7 @@ func (ms *Server) readRequest(exitIdle bool) (req *request, code Status) {
 
 	ms.reqMu.Lock()
 	if !gobbled {
-		ms.outstandingReadBufs--
-		ms.readPool = append(ms.readPool, dest)
+		ms.readPool.Put(dest)
 		dest = nil
 	}
 	ms.reqReaders--
@@ -262,14 +299,12 @@ func (ms *Server) returnRequest(req *request) {
 	}
 
 	req.clear()
-	ms.reqMu.Lock()
-	if req.bufferPoolOutputBuf != nil {
-		ms.readPool = append(ms.readPool, req.bufferPoolInputBuf)
-		ms.outstandingReadBufs--
+
+	if p := req.bufferPoolInputBuf; p != nil {
 		req.bufferPoolInputBuf = nil
+		ms.readPool.Put(p)
 	}
-	ms.reqPool = append(ms.reqPool, req)
-	ms.reqMu.Unlock()
+	ms.reqPool.Put(req)
 }
 
 func (ms *Server) recordStats(req *request) {
@@ -293,6 +328,27 @@ func (ms *Server) Serve() {
 	ms.writeMu.Lock()
 	syscall.Close(ms.mountFd)
 	ms.writeMu.Unlock()
+}
+
+func (ms *Server) handleInit() Status {
+	// The first request should be INIT; read it synchronously,
+	// and don't spawn new readers.
+	orig := ms.singleReader
+	ms.singleReader = true
+	req, errNo := ms.readRequest(false)
+	ms.singleReader = orig
+
+	if errNo != OK || req == nil {
+		return errNo
+	}
+	if code := ms.handleRequest(req); !code.Ok() {
+		return code
+	}
+
+	// INIT is handled. Init the file system, but don't accept
+	// incoming requests, so the file system can setup itself.
+	ms.fileSystem.Init(ms)
+	return OK
 }
 
 func (ms *Server) loop(exitIdle bool) {
@@ -323,13 +379,13 @@ exit:
 	}
 }
 
-func (ms *Server) handleRequest(req *request) {
+func (ms *Server) handleRequest(req *request) Status {
 	req.parse()
 	if req.handler == nil {
 		req.status = ENOSYS
 	}
 
-	if req.status.Ok() && ms.debug {
+	if req.status.Ok() && ms.opts.Debug {
 		log.Println(req.InputDebug())
 	}
 
@@ -348,6 +404,7 @@ func (ms *Server) handleRequest(req *request) {
 			errNo, operationName(req.inHeader.Opcode))
 	}
 	ms.returnRequest(req)
+	return Status(errNo)
 }
 
 func (ms *Server) allocOut(req *request, size uint32) []byte {
@@ -369,7 +426,7 @@ func (ms *Server) write(req *request) Status {
 	}
 
 	header := req.serializeHeader(req.flatDataSize())
-	if ms.debug {
+	if ms.opts.Debug {
 		log.Println(req.OutputDebug())
 	}
 
@@ -378,15 +435,16 @@ func (ms *Server) write(req *request) Status {
 	}
 
 	s := ms.systemWrite(req, header)
-	if req.inHeader.Opcode == _OP_INIT {
-		close(ms.started)
-	}
 	return s
 }
 
 // InodeNotify invalidates the information associated with the inode
 // (ie. data cache, attributes, etc.)
 func (ms *Server) InodeNotify(node uint64, off int64, length int64) Status {
+	if !ms.kernelSettings.SupportsNotify(NOTIFY_INVAL_INODE) {
+		return ENOSYS
+	}
+
 	entry := &NotifyInvalInodeOut{
 		Ino:    node,
 		Off:    off,
@@ -406,7 +464,7 @@ func (ms *Server) InodeNotify(node uint64, off int64, length int64) Status {
 	result := ms.write(&req)
 	ms.writeMu.Unlock()
 
-	if ms.debug {
+	if ms.opts.Debug {
 		log.Println("Response: INODE_NOTIFY", result)
 	}
 	return result
@@ -415,7 +473,8 @@ func (ms *Server) InodeNotify(node uint64, off int64, length int64) Status {
 // DeleteNotify notifies the kernel that an entry is removed from a
 // directory.  In many cases, this is equivalent to EntryNotify,
 // except when the directory is in use, eg. as working directory of
-// some process.
+// some process. You should not hold any FUSE filesystem locks, as that
+// can lead to deadlock.
 func (ms *Server) DeleteNotify(parent uint64, child uint64, name string) Status {
 	if ms.kernelSettings.Minor < 18 {
 		return ms.EntryNotify(parent, name)
@@ -447,15 +506,19 @@ func (ms *Server) DeleteNotify(parent uint64, child uint64, name string) Status 
 	result := ms.write(&req)
 	ms.writeMu.Unlock()
 
-	if ms.debug {
+	if ms.opts.Debug {
 		log.Printf("Response: DELETE_NOTIFY: %v", result)
 	}
 	return result
 }
 
 // EntryNotify should be used if the existence status of an entry
-// within a directory changes.
+// within a directory changes. You should not hold any FUSE filesystem
+// locks, as that can lead to deadlock.
 func (ms *Server) EntryNotify(parent uint64, name string) Status {
+	if !ms.kernelSettings.SupportsNotify(NOTIFY_INVAL_ENTRY) {
+		return ENOSYS
+	}
 	req := request{
 		inHeader: &InHeader{
 			Opcode: _OP_NOTIFY_ENTRY,
@@ -481,10 +544,30 @@ func (ms *Server) EntryNotify(parent uint64, name string) Status {
 	result := ms.write(&req)
 	ms.writeMu.Unlock()
 
-	if ms.debug {
+	if ms.opts.Debug {
 		log.Printf("Response: ENTRY_NOTIFY: %v", result)
 	}
 	return result
+}
+
+// SupportsVersion returns true if the kernel supports the given
+// protocol version or newer.
+func (in *InitIn) SupportsVersion(maj, min uint32) bool {
+	return in.Major >= maj && in.Minor >= min
+}
+
+// SupportsNotify returns whether a certain notification type is
+// supported. Pass any of the NOTIFY_INVAL_* types as argument.
+func (in *InitIn) SupportsNotify(notifyType int) bool {
+	switch notifyType {
+	case NOTIFY_INVAL_ENTRY:
+		return in.SupportsVersion(7, 12)
+	case NOTIFY_INVAL_INODE:
+		return in.SupportsVersion(7, 12)
+	case NOTIFY_INVAL_DELETE:
+		return in.SupportsVersion(7, 18)
+	}
+	return false
 }
 
 var defaultBufferPool BufferPool
@@ -494,8 +577,10 @@ func init() {
 }
 
 // WaitMount waits for the first request to be served. Use this to
-// avoid racing between accessing the (empty) mountpoint, and the OS
-// trying to setup the user-space mount.
-func (ms *Server) WaitMount() {
-	<-ms.started
+// avoid racing between accessing the (empty or not yet mounted)
+// mountpoint, and the OS trying to setup the user-space mount.
+// Currently, this call only necessary on OSX.
+func (ms *Server) WaitMount() error {
+	err := <-ms.ready
+	return err
 }

@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package fuse
 
 import (
@@ -39,6 +43,9 @@ func init() {
 		CAP_AUTO_INVAL_DATA:  "AUTO_INVAL_DATA",
 		CAP_READDIRPLUS:      "READDIRPLUS",
 		CAP_READDIRPLUS_AUTO: "READDIRPLUS_AUTO",
+		CAP_ASYNC_DIO:        "ASYNC_DIO",
+		CAP_WRITEBACK_CACHE:  "WRITEBACK_CACHE",
+		CAP_NO_OPEN_SUPPORT:  "NO_OPEN_SUPPORT",
 	}
 	releaseFlagNames = map[int64]string{
 		RELEASE_FLUSH: "FLUSH",
@@ -90,11 +97,11 @@ func FlagString(names map[int64]string, fl int64, def string) string {
 }
 
 func (me *ForgetIn) string() string {
-	return fmt.Sprintf("{%d}", me.Nlookup)
+	return fmt.Sprintf("{Nlookup=%d}", me.Nlookup)
 }
 
 func (me *_BatchForgetIn) string() string {
-	return fmt.Sprintf("{%d}", me.Count)
+	return fmt.Sprintf("{Count=%d}", me.Count)
 }
 
 func (me *MkdirIn) string() string {
@@ -125,7 +132,7 @@ func (me *SetAttrIn) string() string {
 	if me.Valid&FATTR_MTIME != 0 {
 		s = append(s, fmt.Sprintf("mtime %d.%09d", me.Mtime, me.Mtimensec))
 	}
-	if me.Valid&FATTR_MTIME != 0 {
+	if me.Valid&FATTR_FH != 0 {
 		s = append(s, fmt.Sprintf("fh %d", me.Fh))
 	}
 	// TODO - FATTR_ATIME_NOW = (1 << 7), FATTR_MTIME_NOW = (1 << 8), FATTR_LOCKOWNER = (1 << 9)
@@ -148,17 +155,22 @@ func (me *OpenOut) string() string {
 		FlagString(FuseOpenFlagNames, int64(me.OpenFlags), ""))
 }
 
-func (me *InitIn) String() string {
+func (me *InitIn) string() string {
 	return fmt.Sprintf("{%d.%d Ra 0x%x %s}",
 		me.Major, me.Minor, me.MaxReadAhead,
 		FlagString(initFlagNames, int64(me.Flags), ""))
 }
 
 func (me *InitOut) string() string {
-	return fmt.Sprintf("{%d.%d Ra 0x%x %s %d/%d Wr 0x%x}",
+	return fmt.Sprintf("{%d.%d Ra 0x%x %s %d/%d Wr 0x%x Tg 0x%x}",
 		me.Major, me.Minor, me.MaxReadAhead,
 		FlagString(initFlagNames, int64(me.Flags), ""),
-		me.CongestionThreshold, me.MaxBackground, me.MaxWrite)
+		me.CongestionThreshold, me.MaxBackground, me.MaxWrite,
+		me.TimeGran)
+}
+
+func (s *FsyncIn) string() string {
+	return fmt.Sprintf("{Fh %d Flags %x}", s.Fh, s.FsyncFlags)
 }
 
 func (me *SetXAttrIn) string() string {
@@ -172,6 +184,7 @@ func (me *GetXAttrIn) string() string {
 func (me *GetXAttrOut) string() string {
 	return fmt.Sprintf("{sz %d}", me.Size)
 }
+
 func (me *AccessIn) string() string {
 	return fmt.Sprintf("{%s}", FlagString(accessFlagName, int64(me.Mask), ""))
 }
@@ -186,14 +199,15 @@ func (me *AttrOut) string() string {
 		me.AttrValid, me.AttrValidNsec, &me.Attr)
 }
 
+// Returned by LOOKUP
 func (me *EntryOut) string() string {
-	return fmt.Sprintf("{%d E%d.%09d A%d.%09d %v}",
-		me.NodeId, me.EntryValid, me.EntryValidNsec,
-		me.AttrValid, me.AttrValidNsec, &me.Attr)
+	return fmt.Sprintf("{NodeId: %d Generation=%d EntryValid=%d.%03d AttrValid=%d.%03d Attr=%v}",
+		me.NodeId, me.Generation, me.EntryValid, me.EntryValidNsec/1000000,
+		me.AttrValid, me.AttrValidNsec/1000000, &me.Attr)
 }
 
 func (me *CreateOut) string() string {
-	return fmt.Sprintf("{%v %v}", &me.EntryOut, &me.OpenOut)
+	return fmt.Sprintf("{NodeId: %d Generation=%d %v %v}", me.NodeId, me.Generation, &me.EntryOut, &me.OpenOut)
 }
 
 func (me *StatfsOut) string() string {
@@ -218,6 +232,10 @@ func (o *NotifyInvalDeleteOut) string() string {
 func (f *FallocateIn) string() string {
 	return fmt.Sprintf("{Fh %d off %d sz %d mod 0%o}",
 		f.Fh, f.Offset, f.Length, f.Mode)
+}
+
+func (f *LinkIn) string() string {
+	return fmt.Sprintf("{Oldnodeid: %d}", f.Oldnodeid)
 }
 
 // Print pretty prints FUSE data types for kernel communication

@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package nodefs
 
 // This file contains the internal logic of the
@@ -8,7 +12,6 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -22,10 +25,6 @@ var paranoia = false
 // structs of uint32/uint64) to operations on Go objects representing
 // files and directories.
 type FileSystemConnector struct {
-	// Used as the generation inodes. This must be 64-bit aligned,
-	// for sync/atomic on i386 to work properly.
-	generation uint64
-
 	debug bool
 
 	// Callbacks for talking back to the kernel.
@@ -56,11 +55,8 @@ func NewFileSystemConnector(root Node, opts *Options) (c *FileSystemConnector) {
 	if opts == nil {
 		opts = NewOptions()
 	}
-	c.inodeMap = newHandleMap(opts.PortableInodes)
+	c.inodeMap = newPortableHandleMap()
 	c.rootNode = newInode(true, root)
-
-	// Make sure we don't reuse generation numbers.
-	c.generation = uint64(time.Now().UnixNano())
 
 	c.verify()
 	c.mountRoot(opts)
@@ -68,6 +64,7 @@ func NewFileSystemConnector(root Node, opts *Options) (c *FileSystemConnector) {
 	// FUSE does not issue a LOOKUP for 1 (obviously), but it does
 	// issue a forget.  This lookupUpdate is to make the counts match.
 	c.lookupUpdate(c.rootNode)
+	c.debug = opts.Debug
 
 	return c
 }
@@ -77,13 +74,10 @@ func (c *FileSystemConnector) Server() *fuse.Server {
 	return c.server
 }
 
-// SetDebug toggles printing of debug information.
+// SetDebug toggles printing of debug information. This function is
+// deprecated. Set the Debug option in the Options struct instead.
 func (c *FileSystemConnector) SetDebug(debug bool) {
 	c.debug = debug
-}
-
-func (c *FileSystemConnector) nextGeneration() uint64 {
-	return atomic.AddUint64(&c.generation, 1)
 }
 
 // This verifies invariants of the data structure.  This routine
@@ -100,8 +94,10 @@ func (c *FileSystemConnector) verify() {
 func (c *rawBridge) childLookup(out *fuse.EntryOut, n *Inode, context *fuse.Context) {
 	n.Node().GetAttr((*fuse.Attr)(&out.Attr), nil, context)
 	n.mount.fillEntry(out)
-	out.Ino = c.fsConn().lookupUpdate(n)
-	out.NodeId = out.Ino
+	out.NodeId, out.Generation = c.fsConn().lookupUpdate(n)
+	if out.Ino == 0 {
+		out.Ino = out.NodeId
+	}
 	if out.Nlink == 0 {
 		// With Nlink == 0, newer kernels will refuse link
 		// operations.
@@ -117,13 +113,14 @@ func (c *rawBridge) toInode(nodeid uint64) *Inode {
 	return i
 }
 
-// Must run outside treeLock.  Returns the nodeId.
-func (c *FileSystemConnector) lookupUpdate(node *Inode) (id uint64) {
-	id = c.inodeMap.Register(&node.handled)
+// Must run outside treeLock.  Returns the nodeId and generation.
+func (c *FileSystemConnector) lookupUpdate(node *Inode) (id, generation uint64) {
+	id, generation = c.inodeMap.Register(&node.handled)
 	c.verify()
-	return id
+	return
 }
 
+// forgetUpdate decrements the reference counter for "nodeID" by "forgetCount".
 // Must run outside treeLock.
 func (c *FileSystemConnector) forgetUpdate(nodeID uint64, forgetCount int) {
 	if nodeID == fuse.FUSE_ROOT_ID {
@@ -134,11 +131,33 @@ func (c *FileSystemConnector) forgetUpdate(nodeID uint64, forgetCount int) {
 		return
 	}
 
-	if forgotten, handled := c.inodeMap.Forget(nodeID, forgetCount); forgotten {
-		node := (*Inode)(unsafe.Pointer(handled))
-		node.mount.treeLock.Lock()
-		c.recursiveConsiderDropInode(node)
-		node.mount.treeLock.Unlock()
+	// Prevent concurrent modification of the tree while we are processing
+	// the FORGET
+	node := (*Inode)(unsafe.Pointer(c.inodeMap.Decode(nodeID)))
+	node.mount.treeLock.Lock()
+	defer node.mount.treeLock.Unlock()
+
+	if forgotten, _ := c.inodeMap.Forget(nodeID, forgetCount); forgotten {
+		if len(node.children) > 0 || !node.Node().Deletable() ||
+			node == c.rootNode || node.mountPoint != nil {
+			// We cannot forget a directory that still has children as these
+			// would become unreachable.
+			return
+		}
+		// We have to remove ourself from all parents.
+		// Create a copy of node.parents so we can safely iterate over it
+		// while modifying the original.
+		parents := make(map[parentData]struct{}, len(node.parents))
+		for k, v := range node.parents {
+			parents[k] = v
+		}
+
+		for p := range parents {
+			// This also modifies node.parents
+			p.parent.rmChild(p.name)
+		}
+
+		node.fsInode.OnForget()
 	}
 	// TODO - try to drop children even forget was not successful.
 	c.verify()
@@ -147,39 +166,6 @@ func (c *FileSystemConnector) forgetUpdate(nodeID uint64, forgetCount int) {
 // InodeCount returns the number of inodes registered with the kernel.
 func (c *FileSystemConnector) InodeHandleCount() int {
 	return c.inodeMap.Count()
-}
-
-// Must hold treeLock.
-
-func (c *FileSystemConnector) recursiveConsiderDropInode(n *Inode) (drop bool) {
-	delChildren := []string{}
-	for k, v := range n.children {
-		// Only consider children from the same mount, or
-		// already unmounted mountpoints.
-		if v.mountPoint == nil && c.recursiveConsiderDropInode(v) {
-			delChildren = append(delChildren, k)
-		}
-	}
-	for _, k := range delChildren {
-		ch := n.rmChild(k)
-		if ch == nil {
-			log.Panicf("trying to del child %q, but not present", k)
-		}
-		ch.fsInode.OnForget()
-	}
-
-	if len(n.children) > 0 || !n.Node().Deletable() {
-		return false
-	}
-	if n == c.rootNode || n.mountPoint != nil {
-		return false
-	}
-
-	n.openFilesMutex.Lock()
-	ok := len(n.openFiles) == 0
-	n.openFilesMutex.Unlock()
-
-	return ok
 }
 
 // Finds a node within the currently known inodes, returns the last
@@ -250,7 +236,6 @@ func (c *FileSystemConnector) LookupNode(parent *Inode, path string) *Inode {
 func (c *FileSystemConnector) mountRoot(opts *Options) {
 	c.rootNode.mountFs(opts)
 	c.rootNode.mount.connector = c
-	c.rootNode.Node().OnMount(c)
 	c.verify()
 }
 
@@ -262,12 +247,22 @@ func (c *FileSystemConnector) mountRoot(opts *Options) {
 // It returns ENOENT if the directory containing the mount point does
 // not exist, and EBUSY if the intended mount point already exists.
 func (c *FileSystemConnector) Mount(parent *Inode, name string, root Node, opts *Options) fuse.Status {
+	node, code := c.lockMount(parent, name, root, opts)
+	if !code.Ok() {
+		return code
+	}
+
+	node.Node().OnMount(c)
+	return code
+}
+
+func (c *FileSystemConnector) lockMount(parent *Inode, name string, root Node, opts *Options) (*Inode, fuse.Status) {
 	defer c.verify()
 	parent.mount.treeLock.Lock()
 	defer parent.mount.treeLock.Unlock()
 	node := parent.children[name]
 	if node != nil {
-		return fuse.EBUSY
+		return nil, fuse.EBUSY
 	}
 
 	node = newInode(true, root)
@@ -284,8 +279,7 @@ func (c *FileSystemConnector) Mount(parent *Inode, name string, root Node, opts 
 		log.Printf("Mount %T on subdir %s, parent %d", node,
 			name, c.inodeMap.Handle(&parent.handled))
 	}
-	node.Node().OnMount(c)
-	return fuse.OK
+	return node, fuse.OK
 }
 
 // Unmount() tries to unmount the given inode.  It returns EINVAL if the
@@ -336,10 +330,11 @@ func (c *FileSystemConnector) Unmount(node *Inode) fuse.Status {
 	// We have to wait until the kernel has forgotten the
 	// mountpoint, so the write to node.mountPoint is no longer
 	// racy.
+	mount.treeLock.Unlock()
+	parentNode.mount.treeLock.Unlock()
 	code := c.server.DeleteNotify(parentId, nodeID, name)
+
 	if code.Ok() {
-		mount.treeLock.Unlock()
-		parentNode.mount.treeLock.Unlock()
 		delay := 100 * time.Microsecond
 
 		for {
@@ -360,10 +355,10 @@ func (c *FileSystemConnector) Unmount(node *Inode) fuse.Status {
 			}
 		}
 
-		parentNode.mount.treeLock.Lock()
-		mount.treeLock.Lock()
 	}
 
+	parentNode.mount.treeLock.Lock()
+	mount.treeLock.Lock()
 	mount.mountInode = nil
 	node.mountPoint = nil
 
@@ -391,7 +386,8 @@ func (c *FileSystemConnector) FileNotify(node *Inode, off int64, length int64) f
 
 // EntryNotify makes the kernel forget the entry data from the given
 // name from a directory.  After this call, the kernel will issue a
-// new lookup request for the given name when necessary.
+// new lookup request for the given name when necessary. No filesystem
+// related locks should be held when calling this.
 func (c *FileSystemConnector) EntryNotify(node *Inode, name string) fuse.Status {
 	var nId uint64
 	if node == c.rootNode {
@@ -407,7 +403,8 @@ func (c *FileSystemConnector) EntryNotify(node *Inode, name string) fuse.Status 
 }
 
 // DeleteNotify signals to the kernel that the named entry in dir for
-// the child disappeared.
+// the child disappeared. No filesystem related locks should be held
+// when calling this.
 func (c *FileSystemConnector) DeleteNotify(dir *Inode, child *Inode, name string) fuse.Status {
 	var nId uint64
 

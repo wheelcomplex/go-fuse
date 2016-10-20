@@ -1,20 +1,35 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package nodefs
 
 import (
 	"log"
+	"sync"
 
 	"github.com/hanwen/go-fuse/fuse"
 )
 
 type connectorDir struct {
-	node       Node
-	stream     []fuse.DirEntry
+	node  Node
+	rawFS fuse.RawFileSystem
+
+	// Protect stream and lastOffset.  These are written in case
+	// there is a seek on the directory.
+	mu     sync.Mutex
+	stream []fuse.DirEntry
+
+	// lastOffset stores the last offset for a readdir. This lets
+	// readdir pick up changes to the directory made after opening
+	// it.
 	lastOffset uint64
-	rawFS      fuse.RawFileSystem
-	lookups    []fuse.EntryOut
 }
 
 func (d *connectorDir) ReadDir(input *fuse.ReadIn, out *fuse.DirEntryList) (code fuse.Status) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	if d.stream == nil {
 		return fuse.OK
 	}
@@ -35,7 +50,7 @@ func (d *connectorDir) ReadDir(input *fuse.ReadIn, out *fuse.DirEntryList) (code
 	todo := d.stream[input.Offset:]
 	for _, e := range todo {
 		if e.Name == "" {
-			log.Printf("got emtpy directory entry, mode %o.", e.Mode)
+			log.Printf("got empty directory entry, mode %o.", e.Mode)
 			continue
 		}
 		ok, off := out.AddDirEntry(e)
@@ -48,6 +63,9 @@ func (d *connectorDir) ReadDir(input *fuse.ReadIn, out *fuse.DirEntryList) (code
 }
 
 func (d *connectorDir) ReadDirPlus(input *fuse.ReadIn, out *fuse.DirEntryList) (code fuse.Status) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	if d.stream == nil {
 		return fuse.OK
 	}
@@ -58,21 +76,6 @@ func (d *connectorDir) ReadDirPlus(input *fuse.ReadIn, out *fuse.DirEntryList) (
 		if !code.Ok() {
 			return code
 		}
-		d.lookups = nil
-	}
-
-	if d.lookups == nil {
-		d.lookups = make([]fuse.EntryOut, len(d.stream))
-		for i, n := range d.stream {
-			if n.Name == "." || n.Name == ".." {
-				continue
-			}
-			// We ignore the return value
-			code := d.rawFS.Lookup(&input.InHeader, n.Name, &d.lookups[i])
-			if !code.Ok() {
-				d.lookups[i] = fuse.EntryOut{}
-			}
-		}
 	}
 
 	if input.Offset > uint64(len(d.stream)) {
@@ -80,16 +83,30 @@ func (d *connectorDir) ReadDirPlus(input *fuse.ReadIn, out *fuse.DirEntryList) (
 		return fuse.EINVAL
 	}
 	todo := d.stream[input.Offset:]
-	for i, e := range todo {
+	for _, e := range todo {
 		if e.Name == "" {
 			log.Printf("got empty directory entry, mode %o.", e.Mode)
 			continue
 		}
-		ok, off := out.AddDirLookupEntry(e, &d.lookups[input.Offset+uint64(i)])
-		d.lastOffset = off
-		if !ok {
+
+		// we have to be sure entry will fit if we try to add
+		// it, or we'll mess up the lookup counts.
+		entryDest, off := out.AddDirLookupEntry(e)
+		if entryDest == nil {
 			break
 		}
+		entryDest.Ino = uint64(fuse.FUSE_UNKNOWN_INO)
+
+		// No need to fill attributes for . and ..
+		if e.Name == "." || e.Name == ".." {
+			continue
+		}
+
+		// Clear entryDest before use it, some fields can be corrupted if does not set all fields in rawFS.Lookup
+		*entryDest = fuse.EntryOut{}
+
+		d.rawFS.Lookup(&input.InHeader, e.Name, entryDest)
+		d.lastOffset = off
 	}
 	return fuse.OK
 

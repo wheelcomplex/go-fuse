@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package pathfs
 
 import (
@@ -6,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	"github.com/hanwen/go-fuse/fuse"
 	"github.com/hanwen/go-fuse/fuse/nodefs"
@@ -22,10 +25,27 @@ type loopbackFileSystem struct {
 // system.  Its main purpose is to provide test coverage without
 // having to build a synthetic filesystem.
 func NewLoopbackFileSystem(root string) FileSystem {
+	// Make sure the Root path is absolute to avoid problems when the
+	// application changes working directory.
+	root, err := filepath.Abs(root)
+	if err != nil {
+		panic(err)
+	}
 	return &loopbackFileSystem{
 		FileSystem: NewDefaultFileSystem(),
 		Root:       root,
 	}
+}
+
+func (fs *loopbackFileSystem) StatFs(name string) *fuse.StatfsOut {
+	s := syscall.Statfs_t{}
+	err := syscall.Statfs(fs.GetPath(name), &s)
+	if err == nil {
+		out := &fuse.StatfsOut{}
+		out.FromStatfsT(&s)
+		return out
+	}
+	return nil
 }
 
 func (fs *loopbackFileSystem) OnMount(nodeFs *PathNodeFs) {
@@ -116,18 +136,6 @@ func (fs *loopbackFileSystem) Chown(path string, uid uint32, gid uint32, context
 
 func (fs *loopbackFileSystem) Truncate(path string, offset uint64, context *fuse.Context) (code fuse.Status) {
 	return fuse.ToStatus(os.Truncate(fs.GetPath(path), int64(offset)))
-}
-
-func (fs *loopbackFileSystem) Utimens(path string, Atime *time.Time, Mtime *time.Time, context *fuse.Context) (code fuse.Status) {
-	var a time.Time
-	if Atime != nil {
-		a = *Atime
-	}
-	var m time.Time
-	if Mtime != nil {
-		m = *Mtime
-	}
-	return fuse.ToStatus(os.Chtimes(fs.GetPath(path), a, m))
 }
 
 func (fs *loopbackFileSystem) Readlink(name string, context *fuse.Context) (out string, code fuse.Status) {

@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package fuse
 
 import (
@@ -6,20 +10,10 @@ import (
 
 func TestBufferPool(t *testing.T) {
 	bp := NewBufferPool()
-
-	b1 := bp.AllocBuffer(PAGESIZE)
-	_ = bp.AllocBuffer(2 * PAGESIZE)
-	bp.FreeBuffer(b1)
-
-	b1_2 := bp.AllocBuffer(PAGESIZE)
-	if &b1[0] != &b1_2[0] {
-		t.Error("bp 0")
+	size := 1500
+	buf := bp.AllocBuffer(uint32(size))
+	if len(buf) != size {
+		t.Errorf("Expected buffer of %d bytes, got %d bytes", size, len(buf))
 	}
-
-}
-
-func TestFreeBufferEmpty(t *testing.T) {
-	bp := NewBufferPool()
-	c := make([]byte, 0, 2*PAGESIZE)
-	bp.FreeBuffer(c)
+	bp.FreeBuffer(buf)
 }

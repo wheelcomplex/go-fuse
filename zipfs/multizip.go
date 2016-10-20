@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package zipfs
 
 /*
@@ -32,6 +36,9 @@ type MultiZipFs struct {
 	zips          map[string]nodefs.Node
 	dirZipFileMap map[string]string
 
+	// zip files that we are in the process of unmounting.
+	zombie map[string]bool
+
 	nodeFs *pathfs.PathNodeFs
 	pathfs.FileSystem
 }
@@ -39,6 +46,7 @@ type MultiZipFs struct {
 func NewMultiZipFs() *MultiZipFs {
 	m := &MultiZipFs{
 		zips:          make(map[string]nodefs.Node),
+		zombie:        make(map[string]bool),
 		dirZipFileMap: make(map[string]string),
 		FileSystem:    pathfs.NewDefaultFileSystem(),
 	}
@@ -79,6 +87,7 @@ func (fs *MultiZipFs) OpenDir(name string, context *fuse.Context) (stream []fuse
 
 func (fs *MultiZipFs) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
 	a := &fuse.Attr{}
+	a.Owner = *fuse.CurrentOwner()
 	if name == "" {
 		// Should not write in top dir.
 		a.Mode = fuse.S_IFDIR | 0500
@@ -116,19 +125,30 @@ func (fs *MultiZipFs) Unlink(name string, context *fuse.Context) (code fuse.Stat
 	if dir == CONFIG_PREFIX {
 		fs.lock.Lock()
 		defer fs.lock.Unlock()
-
-		root, ok := fs.zips[basename]
-		if ok {
-			code = fs.nodeFs.UnmountNode(root.Inode())
-			if !code.Ok() {
-				return code
-			}
-			delete(fs.zips, basename)
-			delete(fs.dirZipFileMap, basename)
-			return fuse.OK
-		} else {
+		if fs.zombie[basename] {
 			return fuse.ENOENT
 		}
+		root, ok := fs.zips[basename]
+		if !ok {
+			return fuse.ENOENT
+		}
+
+		name := fs.dirZipFileMap[basename]
+		fs.zombie[basename] = true
+		delete(fs.zips, basename)
+		delete(fs.dirZipFileMap, basename)
+
+		// Drop the lock to ensure that notify doesn't cause a deadlock.
+		fs.lock.Unlock()
+		code = fs.nodeFs.UnmountNode(root.Inode())
+		fs.lock.Lock()
+		delete(fs.zombie, basename)
+		if !code.Ok() {
+			// Failed: reinstate
+			fs.zips[basename] = root
+			fs.dirZipFileMap[basename] = name
+		}
+		return code
 	}
 	return fuse.EPERM
 }
@@ -141,7 +161,9 @@ func (fs *MultiZipFs) Readlink(path string, context *fuse.Context) (val string, 
 
 	fs.lock.Lock()
 	defer fs.lock.Unlock()
-
+	if fs.zombie[base] {
+		return "", fuse.ENOENT
+	}
 	zipfile, ok := fs.dirZipFileMap[base]
 	if !ok {
 		return "", fuse.ENOENT
@@ -157,6 +179,9 @@ func (fs *MultiZipFs) Symlink(value string, linkName string, context *fuse.Conte
 
 	fs.lock.Lock()
 	defer fs.lock.Unlock()
+	if fs.zombie[base] {
+		return fuse.EBUSY
+	}
 
 	_, ok := fs.dirZipFileMap[base]
 	if ok {

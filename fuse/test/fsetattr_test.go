@@ -1,7 +1,10 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package test
 
 import (
-	"io/ioutil"
 	"os"
 	"syscall"
 	"testing"
@@ -10,6 +13,7 @@ import (
 	"github.com/hanwen/go-fuse/fuse"
 	"github.com/hanwen/go-fuse/fuse/nodefs"
 	"github.com/hanwen/go-fuse/fuse/pathfs"
+	"github.com/hanwen/go-fuse/internal/testutil"
 )
 
 type MutableDataFile struct {
@@ -18,6 +22,7 @@ type MutableDataFile struct {
 	data []byte
 	fuse.Attr
 	GetAttrCalled bool
+	FsyncCalled   bool
 }
 
 func (f *MutableDataFile) String() string {
@@ -86,6 +91,11 @@ func (f *MutableDataFile) Chmod(perms uint32) fuse.Status {
 	return fuse.OK
 }
 
+func (f *MutableDataFile) Fsync(flags int) fuse.Status {
+	f.FsyncCalled = true
+	return fuse.OK
+}
+
 ////////////////
 
 // This FS only supports a single r/w file called "/file".
@@ -95,7 +105,7 @@ type FSetAttrFs struct {
 }
 
 func (fs *FSetAttrFs) GetXAttr(name string, attr string, context *fuse.Context) ([]byte, fuse.Status) {
-	return nil, fuse.ENODATA
+	return nil, fuse.ENOATTR
 }
 
 func (fs *FSetAttrFs) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
@@ -133,59 +143,48 @@ func NewFile() *MutableDataFile {
 }
 
 func setupFAttrTest(t *testing.T, fs pathfs.FileSystem) (dir string, clean func()) {
-	dir, err := ioutil.TempDir("", "go-fuse-fsetattr_test")
-	if err != nil {
-		t.Fatalf("TempDir failed: %v", err)
-	}
+	dir = testutil.TempDir()
 	nfs := pathfs.NewPathNodeFs(fs, nil)
-	state, _, err := nodefs.MountRoot(dir, nfs.Root(), nil)
+	opts := nodefs.NewOptions()
+	opts.Debug = testutil.VerboseTest()
+
+	state, _, err := nodefs.MountRoot(dir, nfs.Root(), opts)
 	if err != nil {
 		t.Fatalf("MountNodeFileSystem failed: %v", err)
 	}
-	state.SetDebug(VerboseTest())
 
 	go state.Serve()
-
-	// Trigger INIT.
-	os.Lstat(dir)
-	if state.KernelSettings().Flags&fuse.CAP_FILE_OPS == 0 {
-		t.Log("Mount does not support file operations")
+	if err := state.WaitMount(); err != nil {
+		t.Fatal("WaitMount", err)
 	}
 
-	return dir, func() {
-		if state.Unmount() == nil {
+	clean = func() {
+		if err := state.Unmount(); err != nil {
+			t.Errorf("cleanup: Unmount: %v", err)
+		} else {
 			os.RemoveAll(dir)
 		}
 	}
-}
 
-func TestDataReadLarge(t *testing.T) {
-	fs := &FSetAttrFs{
-		FileSystem: pathfs.NewDefaultFileSystem(),
-	}
-	dir, clean := setupFAttrTest(t, fs)
-	defer clean()
-
-	content := RandomData(385 * 1023)
-	fn := dir + "/file"
-	err := ioutil.WriteFile(fn, []byte(content), 0644)
-	if err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
+	if state.KernelSettings().Flags&fuse.CAP_FILE_OPS == 0 {
+		clean()
+		t.Skip("Mount does not support file operations")
 	}
 
-	back, err := ioutil.ReadFile(fn)
-	if err != nil {
-		t.Fatalf("ReadFile failed: %v", err)
-	}
-	CompareSlices(t, back, content)
+	return dir, clean
 }
 
 func TestFSetAttr(t *testing.T) {
-	fs := pathfs.NewLockingFileSystem(&FSetAttrFs{
+	fSetAttrFs := &FSetAttrFs{
 		FileSystem: pathfs.NewDefaultFileSystem(),
-	})
+	}
+	fs := pathfs.NewLockingFileSystem(fSetAttrFs)
 	dir, clean := setupFAttrTest(t, fs)
-	defer clean()
+	defer func() {
+		if clean != nil {
+			clean()
+		}
+	}()
 
 	fn := dir + "/file"
 	f, err := os.OpenFile(fn, os.O_CREATE|os.O_WRONLY, 0755)
@@ -209,28 +208,27 @@ func TestFSetAttr(t *testing.T) {
 		t.Error("truncate retval", os.NewSyscallError("Ftruncate", code))
 	}
 
-	a, status := fs.GetAttr("file", nil)
-	if !status.Ok() || a.Size != 3 {
+	if a, status := fs.GetAttr("file", nil); !status.Ok() {
+		t.Fatalf("GetAttr: status %v", status)
+	} else if a.Size != 3 {
 		t.Errorf("truncate: size %d, status %v", a.Size, status)
 	}
 
-	err = f.Chmod(024)
-	if err != nil {
+	if err := f.Chmod(024); err != nil {
 		t.Fatalf("Chmod failed: %v", err)
 	}
 
-	a, status = fs.GetAttr("file", nil)
-	if !status.Ok() || a.Mode&07777 != 024 {
-		t.Errorf("chmod: %o, status %v", a.Mode&0777, status)
+	if a, status := fs.GetAttr("file", nil); !status.Ok() {
+		t.Errorf("chmod: %v", status)
+	} else if a.Mode&07777 != 024 {
+		t.Errorf("getattr after chmod: %o", a.Mode&0777)
 	}
 
-	err = os.Chtimes(fn, time.Unix(0, 100e3), time.Unix(0, 101e3))
-	if err != nil {
+	if err := os.Chtimes(fn, time.Unix(0, 100e3), time.Unix(0, 101e3)); err != nil {
 		t.Fatalf("Chtimes failed: %v", err)
 	}
 
-	a, status = fs.GetAttr("file", nil)
-	if !status.Ok() {
+	if a, status := fs.GetAttr("file", nil); !status.Ok() {
 		t.Errorf("GetAttr: %v", status)
 	} else if a.Atimensec != 100e3 || a.Mtimensec != 101e3 {
 		t.Errorf("Utimens: atime %d != 100e3 mtime %d != 101e3",
@@ -246,5 +244,18 @@ func TestFSetAttr(t *testing.T) {
 	if i1 != i2 {
 		t.Errorf("f.Lstat().Ino = %d. Returned %d before.", i2, i1)
 	}
-	// TODO - test chown if run as root.
+
+	if code := syscall.Fsync(int(f.Fd())); code != nil {
+		t.Error("Fsync failed:", os.NewSyscallError("Fsync", code))
+	}
+
+	// Close the file, otherwise we can't unmount.
+	f.Close()
+
+	// Shutdown the FUSE FS so we can safely look at fSetAttrFs
+	clean()
+	clean = nil
+	if !fSetAttrFs.file.FsyncCalled {
+		t.Error("Fsync was not called")
+	}
 }

@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package nodefs
 
 import (
@@ -200,7 +204,9 @@ func (f *loopbackFile) GetAttr(a *fuse.Attr) fuse.Status {
 	return fuse.OK
 }
 
-// Allocate, Utimens implemented in files_linux.go
+// Utimens implemented in files_linux.go
+
+// Allocate implemented in files_linux.go
 
 ////////////////////////////////////////////////////////////////
 

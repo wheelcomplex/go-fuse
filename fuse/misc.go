@@ -1,3 +1,7 @@
+// Copyright 2016 the Go-FUSE Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Random odds and ends.
 
 package fuse
@@ -62,7 +66,11 @@ func ToStatus(err error) Status {
 
 func toSlice(dest *[]byte, ptr unsafe.Pointer, byteCount uintptr) {
 	h := (*reflect.SliceHeader)(unsafe.Pointer(dest))
-	*h = reflect.SliceHeader{uintptr(ptr), int(byteCount), int(byteCount)}
+	*h = reflect.SliceHeader{
+		Data: uintptr(ptr),
+		Len:  int(byteCount),
+		Cap:  int(byteCount),
+	}
 }
 
 func CurrentOwner() *Owner {
