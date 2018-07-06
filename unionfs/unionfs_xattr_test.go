@@ -6,6 +6,7 @@ package unionfs
 
 import (
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 
 type TestFS struct {
 	pathfs.FileSystem
-	xattrRead int
+	xattrRead int64
 }
 
 func (fs *TestFS) GetAttr(path string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
@@ -32,7 +33,7 @@ func (fs *TestFS) GetAttr(path string, context *fuse.Context) (*fuse.Attr, fuse.
 
 func (fs *TestFS) GetXAttr(path string, name string, context *fuse.Context) ([]byte, fuse.Status) {
 	if path == "file" && name == "user.attr" {
-		fs.xattrRead++
+		atomic.AddInt64(&fs.xattrRead, 1)
 		return []byte{42}, fuse.OK
 	}
 	return nil, fuse.ENOATTR
@@ -59,10 +60,11 @@ func TestXAttrCaching(t *testing.T) {
 	}
 
 	opts := &nodefs.Options{
-		EntryTimeout:    entryTtl / 2,
-		AttrTimeout:     entryTtl / 2,
-		NegativeTimeout: entryTtl / 2,
-		Debug:           testutil.VerboseTest(),
+		EntryTimeout:        entryTtl / 2,
+		AttrTimeout:         entryTtl / 2,
+		NegativeTimeout:     entryTtl / 2,
+		Debug:               testutil.VerboseTest(),
+		LookupKnownChildren: true,
 	}
 
 	pathfs := pathfs.NewPathNodeFs(ufs,
@@ -116,8 +118,8 @@ func TestXAttrCaching(t *testing.T) {
 	if got != want {
 		t.Fatalf("Got %q want %q", got, err)
 	}
-
-	if roFS.xattrRead != 1 {
-		t.Errorf("got xattrRead=%d, want 1", roFS.xattrRead)
+	actual := atomic.LoadInt64(&roFS.xattrRead)
+	if actual != 1 {
+		t.Errorf("got xattrRead=%d, want 1", actual)
 	}
 }

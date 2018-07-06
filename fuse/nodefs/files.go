@@ -167,6 +167,14 @@ func (f *loopbackFile) Fsync(flags int) (code fuse.Status) {
 	return r
 }
 
+func (f *loopbackFile) Flock(flags int) fuse.Status {
+	f.lock.Lock()
+	r := fuse.ToStatus(syscall.Flock(int(f.File.Fd()), flags))
+	f.lock.Unlock()
+
+	return r
+}
+
 func (f *loopbackFile) Truncate(size uint64) fuse.Status {
 	f.lock.Lock()
 	r := fuse.ToStatus(syscall.Ftruncate(int(f.File.Fd()), int64(size)))
@@ -210,8 +218,7 @@ func (f *loopbackFile) GetAttr(a *fuse.Attr) fuse.Status {
 
 ////////////////////////////////////////////////////////////////
 
-// NewReadOnlyFile wraps a File so all read/write operations are
-// denied.
+// NewReadOnlyFile wraps a File so all write operations are denied.
 func NewReadOnlyFile(f File) File {
 	return &readOnlyFile{File: f}
 }

@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+for d in fuse fuse/nodefs fuse/pathfs fuse/test zipfs unionfs \
+    example/hello example/loopback example/zipfs \
+    example/multizip example/unionfs example/memfs \
+    example/autounionfs example/statfs ; \
+do
+  go build -o /dev/null github.com/hanwen/go-fuse/${d}
+done
+
 
 for d in fuse zipfs unionfs fuse/test
 do
@@ -24,7 +32,7 @@ for target in "clean" "install" ; do
   for d in fuse fuse/nodefs fuse/pathfs fuse/test zipfs unionfs \
     example/hello example/loopback example/zipfs \
     example/multizip example/unionfs example/memfs \
-    example/autounionfs ; \
+    example/autounionfs example/statfs ; \
   do
     if test "${target}" = "install" && test "${d}" = "fuse/test"; then
       continue

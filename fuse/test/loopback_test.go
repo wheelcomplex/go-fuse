@@ -95,10 +95,11 @@ func NewTestCase(t *testing.T) *testCase {
 		ClientInodes: true})
 	tc.connector = nodefs.NewFileSystemConnector(tc.pathFs.Root(),
 		&nodefs.Options{
-			EntryTimeout:    testTtl,
-			AttrTimeout:     testTtl,
-			NegativeTimeout: 0.0,
-			Debug:           testutil.VerboseTest(),
+			EntryTimeout:        testTtl,
+			AttrTimeout:         testTtl,
+			NegativeTimeout:     0.0,
+			Debug:               testutil.VerboseTest(),
+			LookupKnownChildren: true,
 		})
 	tc.state, err = fuse.NewServer(
 		fuse.NewRawFileSystem(tc.connector.RawFS()), tc.mnt, &fuse.MountOptions{
@@ -373,14 +374,14 @@ func TestLinkForget(t *testing.T) {
 	for _, fn := range []string{"file1", "file2"} {
 		fn = tc.orig + "/" + fn
 		if err := os.Remove(fn); err != nil {
-			t.Fatalf("Remove", err)
+			t.Fatalf("Remove: %v", err)
 		}
 		tc.WriteFile(fn, []byte(c), 0644)
 	}
 	for i, fn := range []string{"file1", "file2"} {
 		fn = tc.mnt + "/" + fn
 		if err := os.Truncate(fn, int64(i)); err != nil {
-			t.Fatalf("Truncate", err)
+			t.Fatalf("Truncate: %v", err)
 		}
 	}
 
@@ -510,6 +511,7 @@ func TestAccess(t *testing.T) {
 
 	contents := []byte{1, 2, 3}
 	tc.WriteFile(tc.origFile, []byte(contents), 0700)
+
 	if err := os.Chmod(tc.origFile, 0); err != nil {
 		t.Fatalf("Chmod failed: %v", err)
 	}

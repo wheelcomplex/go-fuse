@@ -85,10 +85,7 @@ func (c *FileSystemConnector) internalLookup(out *fuse.Attr, parent *Inode, name
 		return c.lookupMountUpdate(out, child.mountPoint)
 	}
 
-	if child != nil {
-		parent = nil
-	}
-	if child != nil {
+	if child != nil && !parent.mount.options.LookupKnownChildren {
 		code = child.fsInode.GetAttr(out, nil, &header.Context)
 	} else {
 		child, code = parent.fsInode.Lookup(out, name, &header.Context)
@@ -453,6 +450,17 @@ func (c *rawBridge) Read(input *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.
 	}
 
 	return node.Node().Read(f, buf, int64(input.Offset), &input.Context)
+}
+
+func (c *rawBridge) Flock(input *fuse.FlockIn, flags int) fuse.Status {
+	node := c.toInode(input.NodeId)
+	opened := node.mount.getOpenedFile(input.Fh)
+
+	if opened != nil {
+		return opened.WithFlags.File.Flock(flags)
+	}
+
+	return fuse.EBADF
 }
 
 func (c *rawBridge) StatFs(header *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {

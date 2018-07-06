@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/fuse"
+	"github.com/hanwen/go-fuse/internal/testutil"
 )
 
 const testTtl = 100 * time.Millisecond
@@ -28,12 +29,13 @@ func setupMemNodeTest(t *testing.T) (wd string, root Node, clean func()) {
 
 	connector := NewFileSystemConnector(root,
 		&Options{
-			EntryTimeout:    testTtl,
-			AttrTimeout:     testTtl,
-			NegativeTimeout: 0.0,
-			Debug:           VerboseTest(),
+			EntryTimeout:        testTtl,
+			AttrTimeout:         testTtl,
+			NegativeTimeout:     0.0,
+			Debug:               testutil.VerboseTest(),
+			LookupKnownChildren: true,
 		})
-	state, err := fuse.NewServer(connector.RawFS(), mnt, &fuse.MountOptions{Debug: VerboseTest()})
+	state, err := fuse.NewServer(connector.RawFS(), mnt, &fuse.MountOptions{Debug: testutil.VerboseTest()})
 	if err != nil {
 		t.Fatal("NewServer", err)
 	}
